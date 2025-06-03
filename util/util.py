@@ -44,6 +44,11 @@ class gen_params(object):
                    grads1, grads2x, grads2y, lin_grads1, lin_grads2x, lin_grads2y, non_simb_ws):
         self.__init__(nbr_mx, nbr_x, nbr_y, nbr_values, nbr_dists, 
                       grads1, grads2x, grads2y, lin_grads1, lin_grads2x, lin_grads2y, non_simb_ws)
+    
+    def copy(self):
+        return gen_params(self.nbr_mx.copy(), self.nbr_x.copy(), self.nbr_y.copy(), self.nbr_values.copy(),
+                          self.nbr_dists.copy(), self.grads1.copy(), self.grads2x.copy(), self.grads2y.copy(),
+                          self.lin_grads1.copy(), self.lin_grads2x.copy(), self.lin_grads2y.copy(), self.non_simb_ws.copy())
 
 @njit # функция возвращает список соседей определённой вершины для триангуляции с параметрами st_p
 def getNeighboursNB_arr(p: int, st_p):#: Union[t_params, st_params]): 
@@ -249,6 +254,14 @@ def calc_sum_mx0(mx):
         last = indexNB(mx[i], np.nan)
         sum_mx[i] = np.sum(mx[i][:last]) if last != 0 else 0
     return sum_mx
+@njit
+def calc_sum_mx1(mx):
+    sum_mx = np.zeros(mx.shape[0])
+    for i in range(mx.shape[0]):
+        last = indexNB(mx[i], np.nan)
+        s = np.sum(mx[i][:last])
+        sum_mx[i] = s if last != 0 and s != 0 else 1
+    return sum_mx
 
 @njit
 def calc_perc_mx(mx, p):
@@ -316,6 +329,339 @@ def push_grad_NB(t_p, g_p:gen_params, s, g):
     new_v = t_p.values + push
 
     return new_v#(gauss_curv > 0)*1.
+
+@vectorize([float64(float64, float64, float64, float64, float64, float64)], nopython=True)
+def gauss_curv_calc_spec(xx, xy, yx, yy, x, y):
+    return 10**6 * (xx*y**2 + 2*x*y*xy*yx* + x**2*yy) #/ (10**3 + x**2 * 10**3 + y**2 * 10**3)**2 
+
+
+
+@njit
+def comb_NB(pool, r):
+    n = len(pool)
+    indices = list(range(r))
+    empty = not(n and (0 < r <= n))
+
+    if not empty:
+        result = [pool[i] for i in indices]
+        yield result
+
+    while not empty:
+        i = r - 1
+        while i >= 0 and indices[i] == i + n - r:
+            i -= 1
+        if i < 0:
+            empty = True
+        else:
+            indices[i] += 1
+            for j in range(i+1, r):
+                indices[j] = indices[j-1] + 1
+
+            result = [pool[i] for i in indices]
+            yield result
+
+@njit
+def isAbovePlane(c, p1, p2, p3):
+    s1 = p1 - p2
+    s2 = p3 - p2
+    n = np.cross(s1, s2)
+    return -np.sign(np.dot(p2 - c, n))
+
+@njit
+def expand(p_set, nbr_mx):
+    res_set = p_set
+    for p in p_set:
+        n_list = nbr_mx[p][:indexNB(nbr_mx[p], 0)]
+        for n in n_list:
+            if n in p_set:
+                continue
+            else:
+                res_set = np.concatenate((res_set, np.array([n])))
+    return res_set
+
+@njit
+def next_neighbor_infenum(vi, found_set, border_difsum, distsum, n_nbrs, depth, max_depth, nbr_mx, lingrads, dists, grad_limit, max_d): 
+    n_list = nbr_mx[vi][:indexNB(nbr_mx[vi], 0)]
+    # print(n_list)
+    new_n_nbrs = n_nbrs
+    new_border_difsum = border_difsum
+    new_set = found_set.copy()
+    if depth != 0:
+        # print(new_n_nbrs, n_nbrs)
+        for i, nbr in enumerate(n_list):
+            if nbr not in found_set: #and lingrads[vi][i] >= 0:
+                # print(nbr)
+                new_border_difsum += lingrads[vi][i]
+                new_n_nbrs += 1
+            elif nbr in found_set: #and -lingrads[vi][i] >= 0:
+                # print(-nbr)
+                new_border_difsum -= -lingrads[vi][i]
+                new_n_nbrs -= 1
+
+        if new_n_nbrs == 0:
+            return found_set, border_difsum, n_nbrs
+        # if new_border_difsum / new_n_nbrs < border_difsum / n_nbrs * 0.95:
+        #     return found_set, border_difsum, n_nbrs
+        if new_border_difsum < border_difsum:
+            # print('old', n_nbrs)
+            return found_set, border_difsum, n_nbrs
+        
+        if vi not in found_set:
+            new_set = np.concatenate((found_set, np.array([vi])))
+        else:
+            new_set = found_set.copy()
+                
+        if depth == max_depth or distsum > max_d:
+            # print('new', new_n_nbrs)
+            return new_set, new_border_difsum, new_n_nbrs
+
+    for i, nbr in enumerate(n_list):
+        if nbr not in new_set and lingrads[vi][i] < grad_limit:
+            # print('start', new_n_nbrs, nbr)
+            new_set, new_border_difsum, new_n_nbrs = next_neighbor_infenum(nbr, new_set, new_border_difsum, distsum + dists[vi][i],
+                                                                            new_n_nbrs, depth + 1, max_depth, nbr_mx, lingrads, dists, grad_limit, max_d)
+    
+    return new_set, new_border_difsum, new_n_nbrs
+
+@njit
+def next_neighbor_supremum(vi, found_set, border_difsum, distsum, n_nbrs, depth, max_depth, nbr_mx, lingrads, dists, grad_limit, max_d): 
+    n_list = nbr_mx[vi][:indexNB(nbr_mx[vi], 0)]
+    
+    new_n_nbrs = n_nbrs
+    new_border_difsum = border_difsum
+    new_set = found_set.copy()
+    if depth != 0:
+        # print(new_n_nbrs, n_nbrs)
+        for i, nbr in enumerate(n_list):
+            if nbr not in found_set: #and lingrads[vi][i] >= 0:
+                new_border_difsum += lingrads[vi][i]
+                new_n_nbrs += 1
+            elif nbr in found_set: #and -lingrads[vi][i] >= 0:
+                new_border_difsum -= -lingrads[vi][i]
+                new_n_nbrs -= 1
+        # print(new_n_nbrs)
+        if new_n_nbrs == 0:
+            return found_set, border_difsum, n_nbrs
+        # if new_border_difsum / new_n_nbrs < border_difsum / n_nbrs * 0.99:
+        #     return found_set, border_difsum, n_nbrs
+        if new_border_difsum > border_difsum:
+            # print('old', n_nbrs)
+            return found_set, border_difsum, n_nbrs
+        
+        if vi not in found_set:
+            new_set = np.concatenate((found_set, np.array([vi])))
+        else:
+            new_set = found_set
+                
+        if depth == max_depth or distsum > max_d:
+            # print('new', new_n_nbrs)
+            return new_set, new_border_difsum, new_n_nbrs
+
+    for i, nbr in enumerate(n_list):
+        if nbr not in new_set: #and lingrads[vi][i] > -grad_limit:
+            # print('start', new_n_nbrs, nbr)
+            new_set, new_border_difsum, new_n_nbrs = next_neighbor_supremum(nbr, new_set, new_border_difsum, distsum + dists[vi][i],
+                                                                            new_n_nbrs, depth + 1, max_depth, nbr_mx, lingrads, dists, grad_limit, max_d)
+    
+    return new_set, new_border_difsum, new_n_nbrs
+
+@njit
+def get_border_grads(p_set, nbr_mx, lingrads):
+    grad_sum = 0
+    n_sum = 0
+    for p in p_set:
+        n_list = nbr_mx[p][:indexNB(nbr_mx[p], 0)]
+        for i, n in enumerate(n_list):
+            if n in p_set:
+                continue
+            grad_sum += lingrads[p][i]
+            n_sum += 1
+    return grad_sum / n_sum
+
+@njit
+def next_neighbor_infenum2(vi, found_set, distsum, depth, max_depth, nbr_mx, lingrads, dists, grad_threshold, max_d): 
+    n_list = nbr_mx[vi][:indexNB(nbr_mx[vi], 0)]
+
+    new_set = found_set.copy()
+    if depth != 0:
+        if vi not in found_set:
+            new_set = np.concatenate((found_set, np.array([vi])))
+        else:
+            new_set = found_set.copy()
+                
+        if depth == max_depth or distsum > max_d:
+            return new_set
+
+    for i, nbr in enumerate(n_list):
+        if nbr not in new_set and 0 <= lingrads[vi][i] < grad_threshold:
+            new_set = next_neighbor_infenum2(nbr, new_set, distsum + dists[vi][i], depth + 1, max_depth, nbr_mx, lingrads, dists, grad_threshold, max_d)
+    
+    return new_set
+
+@njit
+def next_neighbor_supremum2(vi, found_set, distsum, depth, max_depth, nbr_mx, lingrads, dists, grad_threshold, max_d): 
+    n_list = nbr_mx[vi][:indexNB(nbr_mx[vi], 0)]
+
+    new_set = found_set.copy()
+    if depth != 0:
+        if vi not in found_set:
+            new_set = np.concatenate((found_set, np.array([vi])))
+        else:
+            new_set = found_set.copy()
+                
+        if depth == max_depth or distsum > max_d:
+            return new_set
+
+    for i, nbr in enumerate(n_list):
+        if nbr not in new_set and 0 <= -lingrads[vi][i] < grad_threshold:
+            new_set = next_neighbor_infenum2(nbr, new_set, distsum + dists[vi][i], depth + 1, max_depth, nbr_mx, lingrads, dists, grad_threshold, max_d)
+    
+    return new_set
+
+@njit
+def find_block_Inc(g_p:gen_params, grad_threshold, d_threshold_min, d_threshold_max, s_c, vdif, infs, i_numb):
+    block_push_Inc = []
+    block_push_Inc2 = []
+    
+    for inf in infs:
+        extr_ps = np.array([inf])
+        border_difsum = np.sum(g_p.lin_grads1[inf][~np.isnan(vdif[inf])])
+        n_nbrs = vdif[inf][~np.isnan(vdif[inf])].shape[0]
+        
+        extr_ps, border_difsum, n_nbrs = next_neighbor_infenum(inf, extr_ps, border_difsum, 0, n_nbrs, 0, 100,
+                                                                g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists, grad_threshold * 2, d_threshold_max)
+
+        if border_difsum / n_nbrs >= grad_threshold * s_c:
+            block_push_Inc.extend(extr_ps)
+
+        border_grads = []
+        extr_ps2 = []
+        for i, diam in enumerate(np.linspace(d_threshold_min, d_threshold_max, i_numb)):
+            extr_ps2.append(np.array([inf]))
+            extr_ps2[i] = next_neighbor_infenum2(inf, extr_ps2[i], 0, 0, 100, g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists,
+                                                grad_threshold * s_c, diam)
+            border_grads.append(get_border_grads(extr_ps2[i], g_p.nbr_mx, g_p.lin_grads1))
+        border_grads = np.array(border_grads)
+        if np.max(border_grads) < grad_threshold * s_c:
+            continue
+        block_push_Inc2.extend(extr_ps2[np.argmax(border_grads)])
+       
+    block_push_Inc = np.array(list(set(block_push_Inc)))
+    block_push_Inc2.extend(block_push_Inc)
+    block_push_Inc = np.array(list(set(block_push_Inc2)))
+    block_push_Inc = expand(block_push_Inc, g_p.nbr_mx)
+
+    return block_push_Inc
+
+@njit
+def find_block_Dec(g_p:gen_params, grad_threshold, d_threshold_min, d_threshold_max, s_c, vdif, sups, i_numb):
+    block_push_Dec = []
+    block_push_Dec2 = []
+    for sup in sups:
+        extr_ps = np.array([sup])
+        border_difsum = np.sum(g_p.lin_grads1[sup][~np.isnan(vdif[sup])])
+        n_nbrs = vdif[sup][~np.isnan(vdif[sup])].shape[0]
+        
+        extr_ps, border_difsum, n_nbrs = next_neighbor_supremum(sup, extr_ps, border_difsum, 0, n_nbrs, 0, 100,
+                                                                g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists, grad_threshold * 2, d_threshold_max)
+
+        if -border_difsum / n_nbrs >= grad_threshold * s_c:
+            block_push_Dec.extend(extr_ps)
+        border_grads = []
+        extr_ps2 = []
+        for i, diam in enumerate(np.linspace(d_threshold_min, d_threshold_max, i_numb)):
+            extr_ps2.append(np.array([sup]))
+            extr_ps2[i] = next_neighbor_supremum2(sup, extr_ps2[i], 0, 0, 100, g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists,
+                                                grad_threshold * s_c, diam)
+            border_grads.append(-get_border_grads(extr_ps2[i], g_p.nbr_mx, g_p.lin_grads1))
+        border_grads = np.array(border_grads)
+        if np.max(border_grads) < grad_threshold * s_c:
+            continue
+        block_push_Dec2.extend(extr_ps2[np.argmax(border_grads)])
+       
+    block_push_Dec = np.array(list(set(block_push_Dec)))
+    block_push_Dec2.extend(block_push_Dec)
+    block_push_Dec = np.array(list(set(block_push_Dec2)))
+    block_push_Dec = expand(block_push_Dec, g_p.nbr_mx)
+
+    return block_push_Dec
+
+@njit
+def calc_a_param(g_p:gen_params):
+    xpart = np.zeros(g_p.nbr_mx.shape)
+    ypart = np.zeros(g_p.nbr_mx.shape)
+    multi_mx_on_vec_per_row(g_p.nbr_x, g_p.grads1[:, 0], xpart)
+    multi_mx_on_vec_per_row(g_p.nbr_y, g_p.grads1[:, 1], ypart)
+    grad_len = np.zeros(g_p.nbr_mx.shape[0])
+    lengths_mx_flat(g_p.grads1[:, 0], g_p.grads1[:, 1], grad_len)
+    nomer = xpart + ypart
+    denom = np.zeros(g_p.nbr_mx.shape)
+    multi_mx_on_vec_per_row(g_p.nbr_dists, grad_len, denom)
+    return nomer / denom
+
+@njit
+def push_grad_extremum_part1(t_p, g_p:gen_params, extr_threshold, d_threshold_min, d_threshold_max, s_c=1, ret_form_mask=False):
+    vdif = getdifxy(t_p.values, g_p.nbr_mx)
+    infs, sups = [], []
+    for i, p_nbrs in enumerate(vdif):
+        if np.isnan(p_nbrs[0]):
+            continue
+        notnan_nbrs = p_nbrs[~np.isnan(p_nbrs)]
+        if np.sort(notnan_nbrs)[0] >= 0:
+            infs.append(i)
+        elif np.sort(notnan_nbrs)[-1] <= 0:
+            sups.append(i)
+    infs = np.array(infs)
+    sups = np.array(sups)
+
+    av_dist = calc_perc_mx(g_p.nbr_dists, 0.5)
+    grad_threshold = extr_threshold / av_dist
+    i_numb = int(np.round((d_threshold_max - d_threshold_min) / av_dist))
+
+    block_push_Inc = find_block_Inc(g_p, grad_threshold, d_threshold_min, d_threshold_max, s_c, vdif, infs, i_numb)
+    block_push_Dec = find_block_Dec(g_p, grad_threshold, d_threshold_min, d_threshold_max, s_c, vdif, sups, i_numb)
+    
+    if ret_form_mask:
+        new_f_mask = np.zeros(t_p.values.shape) 
+        new_f_mask[block_push_Inc] = -np.ones(block_push_Inc.shape)
+        new_f_mask[block_push_Dec] = np.ones(block_push_Dec.shape)
+        both = np.array(list(set(block_push_Inc) & set(block_push_Dec)))
+        new_f_mask[both] = np.ones(both.shape) * 2
+        return block_push_Inc, block_push_Dec, new_f_mask
+
+    return block_push_Inc, block_push_Dec, np.ones(1)
+    
+@njit
+def push_grad_extremum_part2(block_push_Dec, t_p, g_p:gen_params, s, g):
+    vdif = getdifxy(t_p.values, g_p.nbr_mx)
+    push = np.zeros(t_p.values.shape)
+    pointsToLow = np.array(list(set(range(vdif.shape[0])) - set(block_push_Dec.astype(np.int64)) - set([0])))
+    a = calc_a_param(g_p)
+
+    lin_grads_edited = (np.abs(g_p.lin_grads1) / g)**s
+    for (i, j), el in np.ndenumerate(lin_grads_edited > 1):
+        if el:
+            lin_grads_edited[i][j] = 1. 
+
+    push[pointsToLow] = calc_sum_mx0((vdif < 0) * (a < 0) * vdif * lin_grads_edited * a)[pointsToLow] / calc_sum_mx1((vdif < 0) * a * (a < 0))[pointsToLow]
+    
+    return t_p.values + push
+
+@njit
+def push_grad_extremum_part3(block_push_Inc, t_p, g_p:gen_params, s, g):
+    vdif = getdifxy(t_p.values, g_p.nbr_mx)
+    push = np.zeros(t_p.values.shape)
+    a = calc_a_param(g_p)
+    pointsToIncrs = np.array(list(set(range(vdif.shape[0])) - set(block_push_Inc.astype(np.int64)) - set([0])))
+
+    lin_grads_edited = (np.abs(g_p.lin_grads1) / g)**s
+    for (i, j), el in np.ndenumerate(lin_grads_edited > 1):
+        if el:
+            lin_grads_edited[i][j] = 1. 
+
+    push[pointsToIncrs] = calc_sum_mx0((vdif > 0) * (a > 0) * vdif * lin_grads_edited * a)[pointsToIncrs] / calc_sum_mx1((vdif > 0) * a * (a > 0))[pointsToIncrs]
+    
+    return t_p.values + push
 
 
 @njit
@@ -413,3 +759,202 @@ def select_points(lats, lons, radius=1_000_000, units='degrees'):
             saved_p.append(i)
 
     return np.array(saved_p)
+
+
+
+
+#ANOTHER WAY TO CALC EXTREMUMS
+# while True:
+        # for e in range(10):
+        #     for p in extr_ps:
+        #         n_list = g_p.nbr_mx[p][:indexNB(g_p.nbr_mx[p], 0)]
+        #         for n in n_list:
+        #             if n not in extr_ps:
+        #                 break
+        #         else:
+        #             continue
+        #         extr_ps, border_difsum, n_nbrs = next_neighbor_infenum(p, extr_ps, border_difsum, n_nbrs, 0, 1, g_p.nbr_mx, lin_grads, grad_threshold)
+        #     if border_difsum == border_difsum_last:
+        #         break
+        #     border_difsum_last = border_difsum
+
+#CURVATURE
+# f = True
+    # val_dif = getdifxy(t_p.values, g_p.nbr_mx)
+    # infs, sups = [], []
+    # for i, p_nbrs in enumerate(val_dif):
+    #     if np.isnan(p_nbrs[0]):
+    #         continue
+    #     notnan_nbrs = p_nbrs[~np.isnan(p_nbrs)]
+    #     combs = comb_NB(np.arange(notnan_nbrs.shape[0]), 3)
+    #     sumconv = 0
+    #     for comb in combs:
+    #         xs = g_p.nbr_x[i][np.array(comb)]
+    #         ys = g_p.nbr_y[i][np.array(comb)]
+    #         vs = val_dif[i][np.array(comb)]
+    #         if f:
+                
+    #             f = False
+    #         p1 = np.array([xs[0], ys[0], vs[0]])
+    #         p2 = np.array([xs[1], ys[1], vs[1]])
+    #         p3 = np.array([xs[2], ys[2], vs[2]])
+    #         sumconv += isAbovePlane(np.zeros(3), p1, p2, p3)#np.array([xs[0], ys[0], vs[0]]), np.array([xs[1], ys[1], vs[1]]), np.array([xs[2], ys[2], vs[2]]))
+    #     if sumconv <= 0:
+    #         infs.append(i)
+    #     elif sumconv > 0:
+    #         sups.append(i)
+    # infs = np.array(infs)
+    # sups = np.array(sups)
+    # new_v = np.zeros(t_p.values.shape)
+    # new_v[infs] = -np.ones(infs.shape)
+    # new_v[sups] = np.ones(sups.shape)
+    #print(vdif)
+
+    
+@njit
+def push_grad_extremum_old(t_p, g_p:gen_params, s, g, extr_threshold, d_threshold_min, d_threshold_max, s_c=1):
+    
+    vdif = getdifxy(t_p.values, g_p.nbr_mx)
+    xpart = np.zeros(g_p.nbr_mx.shape)
+    ypart = np.zeros(g_p.nbr_mx.shape)
+    multi_mx_on_vec_per_row(g_p.nbr_x, g_p.grads1[:, 0], xpart)
+    multi_mx_on_vec_per_row(g_p.nbr_y, g_p.grads1[:, 1], ypart)
+    grad_len = np.zeros(g_p.nbr_mx.shape[0])
+    lengths_mx_flat(g_p.grads1[:, 0], g_p.grads1[:, 1], grad_len)
+    nomer = xpart + ypart
+    denom = np.zeros(g_p.nbr_mx.shape)
+    multi_mx_on_vec_per_row(g_p.nbr_dists, grad_len, denom)
+    a = nomer / denom
+
+    # gauss_curv = -gauss_curv_calc_spec(g_p.grads2x[:, 0], g_p.grads2x[:, 1], g_p.grads2y[:, 0], g_p.grads2y[:, 1], g_p.grads1[:, 0], g_p.grads1[:, 1])
+    # pointsToLow = np.logical_and(calc_sum_mx0((vdif < 0) * a * (a < 0)) != 0, gauss_curv > 0)
+    # pointsToIncrs = np.logical_and(calc_sum_mx0((vdif > 0) * a * (a > 0)) != 0, gauss_curv < 0)
+    lin_grads_edited = (np.abs(g_p.lin_grads1) / g)**s
+    for (i, j), el in np.ndenumerate(lin_grads_edited > 1):
+        if el:
+            lin_grads_edited[i][j] = 1. 
+
+    # g_sign = np.sign(gauss_curv)
+
+    infs, sups = [], []
+    for i, p_nbrs in enumerate(vdif):
+        if np.isnan(p_nbrs[0]):
+            continue
+        notnan_nbrs = p_nbrs[~np.isnan(p_nbrs)]
+        if np.sort(notnan_nbrs)[0] >= 0:
+            infs.append(i)
+        elif np.sort(notnan_nbrs)[-1] <= 0:
+            sups.append(i)
+    infs = np.array(infs)
+    sups = np.array(sups)
+    # print(infs, sups)
+    
+    block_push_Inc = []
+    block_push_Inc2 = []
+    av_dist = calc_perc_mx(g_p.nbr_dists, 0.5)
+    i_numb = int(np.round((d_threshold_max - d_threshold_min) / av_dist))
+    lin_grads = vdif / g_p.nbr_dists
+    grad_threshold = extr_threshold / av_dist
+    for inf in infs:
+        extr_ps = np.array([inf])
+        border_difsum = np.sum(lin_grads[inf][~np.isnan(vdif[inf])])
+        n_nbrs = vdif[inf][~np.isnan(vdif[inf])].shape[0]
+        
+        extr_ps, border_difsum, n_nbrs = next_neighbor_infenum(inf, extr_ps, border_difsum, 0, n_nbrs, 0, 100,
+                                                                g_p.nbr_mx, lin_grads, g_p.nbr_dists, grad_threshold * 2, d_threshold_max)
+
+        if border_difsum / n_nbrs < grad_threshold * s_c:
+            border_grads = []
+            extr_ps2 = []
+            for i, diam in enumerate(np.linspace(d_threshold_min, d_threshold_max, i_numb)):
+                extr_ps2.append(np.array([inf]))
+                extr_ps2[i] = next_neighbor_infenum2(inf, extr_ps2[i], 0, 0, 100, g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists,
+                                                    grad_threshold * s_c, diam)
+                border_grads.append(get_border_grads(extr_ps2[i], g_p.nbr_mx, g_p.lin_grads1))
+            border_grads = np.array(border_grads)
+            if np.max(border_grads) < grad_threshold * s_c:
+                continue
+            block_push_Inc2.extend(extr_ps2[np.argmax(border_grads)])
+       
+        block_push_Inc.extend(extr_ps)
+    block_push_Inc = np.array(list(set(block_push_Inc)))
+
+    for p in block_push_Inc:
+        border_grads = []
+        extr_ps2 = []
+        for i, diam in enumerate(np.linspace(d_threshold_min, d_threshold_max, i_numb)):
+            extr_ps2.append(np.array([p]))
+            extr_ps2[i] = next_neighbor_infenum2(p, extr_ps2[i], 0, 0, 100, g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists,
+                                                grad_threshold * s_c, diam)
+            border_grads.append(get_border_grads(extr_ps2[i], g_p.nbr_mx, g_p.lin_grads1))
+        border_grads = np.array(border_grads)
+        if np.max(border_grads) < grad_threshold * s_c:
+            continue
+        block_push_Inc2.extend(extr_ps2[np.argmax(border_grads)])
+    block_push_Inc2.extend(block_push_Inc)
+    block_push_Inc = np.array(list(set(block_push_Inc2)))
+    block_push_Inc = expand(block_push_Inc, g_p.nbr_mx)
+    # new_v = np.zeros(t_p.values.shape) 
+    # new_v[block_push_Inc] = np.ones(block_push_Inc.shape)
+
+
+    block_push_Dec = []
+    block_push_Dec2 = []
+    for sup in sups:
+        extr_ps = np.array([sup])
+        border_difsum = np.sum(lin_grads[sup][~np.isnan(vdif[sup])])
+        n_nbrs = vdif[sup][~np.isnan(vdif[sup])].shape[0]
+        
+        extr_ps, border_difsum, n_nbrs = next_neighbor_supremum(sup, extr_ps, border_difsum, 0, n_nbrs, 0, 100,
+                                                                g_p.nbr_mx, lin_grads, g_p.nbr_dists, grad_threshold * 2, d_threshold_max)
+
+        if -border_difsum / n_nbrs < grad_threshold * s_c:
+            border_grads = []
+            extr_ps2 = []
+            for i, diam in enumerate(np.linspace(d_threshold_min, d_threshold_max, i_numb)):
+                extr_ps2.append(np.array([inf]))
+                extr_ps2[i] = next_neighbor_supremum2(sup, extr_ps2[i], 0, 0, 100, g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists,
+                                                    grad_threshold * s_c, diam)
+                border_grads.append(-get_border_grads(extr_ps2[i], g_p.nbr_mx, g_p.lin_grads1))
+            border_grads = np.array(border_grads)
+            if np.max(border_grads) < grad_threshold * s_c:
+                continue
+            block_push_Dec2.extend(extr_ps2[np.argmax(border_grads)])
+       
+        block_push_Dec.extend(extr_ps)
+    block_push_Dec = np.array(list(set(block_push_Dec)))
+
+    for p in block_push_Dec:
+        border_grads = []
+        extr_ps2 = []
+        for i, diam in enumerate(np.linspace(d_threshold_min, d_threshold_max, i_numb)):
+            extr_ps2.append(np.array([p]))
+            extr_ps2[i] = next_neighbor_supremum2(p, extr_ps2[i], 0, 0, 100, g_p.nbr_mx, g_p.lin_grads1, g_p.nbr_dists,
+                                                grad_threshold * s_c, diam)
+            border_grads.append(-get_border_grads(extr_ps2[i], g_p.nbr_mx, g_p.lin_grads1))
+        border_grads = np.array(border_grads)
+        if np.max(border_grads) < grad_threshold * s_c:
+            continue
+        block_push_Dec2.extend(extr_ps2[np.argmax(border_grads)])
+    block_push_Dec2.extend(block_push_Dec)
+    block_push_Dec = np.array(list(set(block_push_Dec2)))
+    block_push_Dec = expand(block_push_Dec, g_p.nbr_mx)
+
+    pointsToIncrs = np.array(list(set(range(vdif.shape[0])) - set(block_push_Inc) - set([0])))
+    pointsToLow = np.array(list(set(range(vdif.shape[0])) - set(block_push_Dec) - set([0])))
+
+    # new_v = np.zeros(t_p.values.shape) 
+    # new_v[block_push_Dec] = np.ones(block_push_Dec.shape)
+    new_v = np.zeros(t_p.values.shape)
+    push = np.zeros(t_p.values.shape[0])
+    
+    # new_v[pointsToLow] = -np.ones(pointsToLow.shape)
+    # new_v[pointsToIncrs] += np.ones(pointsToIncrs.shape)
+    push[pointsToLow] = calc_sum_mx0((vdif < 0) * (a < 0) * vdif * lin_grads_edited * a)[pointsToLow] / calc_sum_mx1((vdif < 0) * a * (a < 0))[pointsToLow]
+    push[pointsToIncrs] += calc_sum_mx0((vdif > 0) * (a > 0) * vdif * lin_grads_edited * a)[pointsToIncrs] / calc_sum_mx1((vdif > 0) * a * (a > 0))[pointsToIncrs]
+    # print(list(calc_sum_mx1((vdif < 0) * a * (a < 0))[pointsToLow]))
+    # print(list(calc_sum_mx1((vdif > 0) * a * (a > 0))[pointsToIncrs]))
+    new_v = t_p.values + push
+
+    return new_v #(gauss_curv > 0)*1.
+

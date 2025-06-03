@@ -6,9 +6,10 @@ from numba.core import types
 from numba import njit
 from typing import Union, Sequence
 from plyfile import PlyData, PlyElement
+from copy import deepcopy
 
-from util.util import deleteTriangleNB_arr, getMultiPolygonFromFile, getNeighboursNB_arr, calcNbrMatrixNB, gen_params, push_grad_min_NB, push_grad_NB, non_simbson_smooth_NB, ang_order, deleteTriangleNB_arr2
-from spherical.util_st import containsXY_mp_array, getAzimXY, calculate_gradients_NB, calculate_non_simb_ws_NB, smart_smoother_NB
+from util.util import deleteTriangleNB_arr, getMultiPolygonFromFile, getNeighboursNB_arr, calcNbrMatrixNB, gen_params, push_grad_min_NB, push_grad_NB, non_simbson_smooth_NB, ang_order, deleteTriangleNB_arr2, push_grad_extremum_part1, push_grad_extremum_part2, push_grad_extremum_part3
+from spherical.util_st import containsXY_mp_array, getAzimXY, calculate_gradients_NB, calculate_non_simb_ws_NB, idw_smoother_NB, nbr_smoother_NB
 from planar.planar import t_params, t_gen 
 
 NANINT = 2147483646
@@ -39,6 +40,9 @@ class st_params(object):
     def set_params(self, lons, lats, values, lst, lptr, lend, trs):
         self.__init__(lons, lats, values, lst, lptr, lend, trs)
 
+    def copy(self):
+        return st_params(self.lons[1:].copy(), self.lats[1:].copy(), self.values[1:].copy(),
+                         self.lst.copy(), (self.lptr + 1).copy(), (self.lend[1:] + 1).copy(), (self.trs - 1).copy())
 
 
 # класс триангуляции с методами генерализации
@@ -60,7 +64,7 @@ class st_gen(stp.sTriangulation):
         
         if type(st_p) != type(None):
             super().__init__(st_p.lons[1:], st_p.lats[1:])
-            self.st_p = st_p
+            self.st_p = st_p.copy()
             self.upd_st()
 
         else:
@@ -100,15 +104,17 @@ class st_gen(stp.sTriangulation):
         if type(border_src) != type(None):
             self.cutTriangulation(border_src)
 
+        self.t = None
+        self.g_p = None
         self.orig_lats = self.lats
         self.orig_lons = self.lons
         self.gen_params = False
         self.non_simb_ws_flag = False
         if type(g_p) != type(None):
             self.gen_params = True
-            self.g_p = g_p
-            if g_p.non_simb_ws[1][0] != 0:
-                self.non_simb_ws_flag = True
+            self.g_p = g_p.copy()
+            # if g_p.non_simb_ws[1][0] != 0:
+            #     self.non_simb_ws_flag = True
             
 
        
@@ -129,6 +135,23 @@ class st_gen(stp.sTriangulation):
         self._simplices = np.array([i for i in self.st_p.trs - 1 if i[0] + 1 != NANINT])
         self.values = self.st_p.values[1:]
         self.upd_params()
+
+        
+    def create_new_st(self, new_v=None):
+        if type(self.g_p) != type(None):
+            new_st = st_gen(st_p=self.st_p, data_crs=self.data_crs, g_p=self.g_p)
+        else: 
+            new_st = st_gen(st_p=self.st_p, data_crs=self.data_crs)
+        new_st.non_simb_ws_flag = self.non_simb_ws_flag
+        if type(new_v) != type(None):
+            new_st.st_p.values = new_v.copy()
+            if type(self.g_p) != type(None):
+                
+                new_st.g_p.nbr_values = new_v[new_st.g_p.nbr_mx].copy()
+                
+        new_st.upd_st()
+        return new_st
+
     
     def deleteTriangle(self, n):
         deleteTriangleNB_arr(n, self.st_p)
@@ -137,8 +160,12 @@ class st_gen(stp.sTriangulation):
     def cutTriangulation(self, mask_src: str):
         #print('StartCut')
         mask, mask_crs_str = getMultiPolygonFromFile(mask_src, returnCRS=True)
+
         mask_crs = CRS.from_user_input(mask_crs_str)
-        transformer = Transformer.from_crs(mask_crs, self.data_crs)
+        if mask_crs.geodetic_crs:
+            transformer = None
+        else:
+            transformer = Transformer.from_crs(mask_crs, self.data_crs)
         
         midlons, midlats = self.face_midpoints()
         
@@ -189,29 +216,41 @@ class st_gen(stp.sTriangulation):
     def push_grad_min(self, s, g):
         self.calculate_gradients(degree=1)
         new_v = push_grad_min_NB(self.st_p, self.g_p, s, g)
-        new_st = st_gen(st_p=self.st_p, data_crs=self.data_crs, g_p=self.g_p)
-        new_st.st_p.values = new_v
-        new_st.upd_st()
-        return new_st
+        return self.create_new_st(new_v)
     
     def push_grad(self, s, g):
         self.calculate_gradients(degree=1)
         self.calculate_gradients(degree=2)
         new_v = push_grad_NB(self.st_p, self.g_p, s, g)
-        new_st = st_gen(st_p=self.st_p, data_crs=self.data_crs, g_p=self.g_p)
-        new_st.st_p.values = new_v
-        new_st.upd_st()
-        return new_st
-    
+        return self.create_new_st(new_v)
 
-    def smart_smoother(self, depth=1):       
+    def push_grad_extremum(self, s, g, iso_step, s_min, s_max, form_density=1, ret_form_mask=False):
+        self.calculate_gradients(degree=1)
+        if ret_form_mask:
+            block_push_Inc, block_push_Dec, new_f_mask = push_grad_extremum_part1(self.st_p, self.g_p, iso_step, s_min, s_max, form_density, ret_form_mask)
+        else: 
+            block_push_Inc, block_push_Dec, _ = push_grad_extremum_part1(self.st_p, self.g_p, iso_step, s_min, s_max, form_density)
+        new_v = push_grad_extremum_part2(block_push_Dec, self.st_p, self.g_p, s, g)
+        st2 = self.create_new_st(new_v)
+        st2.calculate_gradients(degree=1)
+        new_v = push_grad_extremum_part3(block_push_Inc, st2.st_p, st2.g_p, s, g)
+        if ret_form_mask:
+            st3 = self.create_new_st(new_v)
+            f_mask = self.create_new_st(new_f_mask)
+            return st3, f_mask
+        return self.create_new_st(new_v)
+
+    def idw_smooth(self, depth=1, strength=1):
         if self.gen_params == False:
             self.calc_gen_params()
-        new_v = smart_smoother_NB(self.st_p, depth, self.g_p.nbr_mx)
-        new_st = st_gen(st_p=self.st_p, data_crs=self.data_crs, g_p=self.g_p)
-        new_st.st_p.values = new_v
-        new_st.upd_st()
-        return new_st
+        new_v = idw_smoother_NB(self.st_p, depth, strength, self.g_p.nbr_mx)
+        return self.create_new_st(new_v)
+    
+    def nbr_smooth(self, depth=1, strength=1):
+        if self.gen_params == False:
+            self.calc_gen_params()
+        new_v = nbr_smoother_NB(self.st_p, depth, strength, self.g_p.nbr_mx)
+        return self.create_new_st(new_v)
 
     def calculate_non_simb_ws(self):
         self.non_simb_ws_flag = True
@@ -230,11 +269,7 @@ class st_gen(stp.sTriangulation):
 
         new_v = non_simbson_smooth_NB(self.st_p.values, self.g_p.non_simb_ws,
                                       self.g_p.nbr_values, strength=strength)
-        new_st = st_gen(st_p=self.st_p, data_crs=self.data_crs, g_p=self.g_p)
-        new_st.st_p.values = new_v
-        new_st.upd_st()
-        return new_st
-    
+        return self.create_new_st(new_v)
 
 
     @njit
@@ -248,22 +283,57 @@ class st_gen(stp.sTriangulation):
     
 
 
-    def export_to_ply(self, export_file_name: str, export_crs_str: Union[str, None] = None):
+    def export_to_ply(self, export_file_name: str, export_crs_str: Union[str, None] = None, break_meredian_b=True):
+        trs_to_del = []
+
         if type(export_crs_str) == type(None):
             export_crs = self.data_crs
-            proj_x, proj_y = self.lons, self.lats
         else:
             export_crs = CRS.from_user_input(export_crs_str)
+            
+
+        if type(self.t) != type(None):
+            self.t.export_to_ply(export_file_name, export_crs_str)
+        else:
+            if break_meredian_b:
+                par_n = 0
+                for i, par in enumerate(export_crs.coordinate_operation.params):
+                    if par.name == 'Longitude of natural origin':
+                        par_n = i
+                        break
+                break_meredian = (export_crs.coordinate_operation.params[par_n].value - 180) / 180 * 3.14159
+                for tr_i, tr in enumerate(self.st_p.trs):
+                    trs_to_del_flag = False
+                    lon1, lon2, is180cross = ang_order(self.st_p.lons[tr[0]], self.st_p.lons[tr[1]])
+                    if not is180cross or break_meredian > 0:
+                        if (lon1 - break_meredian) * (lon2 - break_meredian) <= 0:
+                            trs_to_del_flag = True
+                    else:
+                        if (lon1 - break_meredian - 3.14159 * 2) * (lon2 - break_meredian - 3.14159 * 2) <= 0:
+                            trs_to_del_flag = True
+                    lon1, lon2, is180cross = ang_order(self.st_p.lons[tr[1]], self.st_p.lons[tr[2]])
+                    if not is180cross or break_meredian > 0:
+                        if (lon1 - break_meredian) * (lon2 - break_meredian) <= 0:
+                            trs_to_del_flag = True
+                    else:
+                        if (lon1 - break_meredian - 3.14159 * 2) * (lon2 - break_meredian - 3.14159 * 2) <= 0:
+                            trs_to_del_flag = True
+                    if trs_to_del_flag:
+                        trs_to_del.append(tr_i)
+            flat_st_p = self.st_p.copy()
+            for i in trs_to_del:
+                deleteTriangleNB_arr(i, flat_st_p)
+
             transformer = Transformer.from_crs(self.data_crs, export_crs)
-            proj_x, proj_y = zip(*list(transformer.itransform(list(zip(self.lats, self.lons)), radians=True)))
+            proj_x, proj_y = zip(*list(transformer.itransform(list(zip(flat_st_p.lats[1:], flat_st_p.lons[1:])), radians=True)))
 
-        vertex = np.array(list(zip(proj_x, proj_y, self.values)), dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')])
+            vertex = np.array(list(zip(proj_x, proj_y, flat_st_p.values[1:])), dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')])
+            face = np.array([i for i in flat_st_p.trs - 1 if i[0] + 1 != NANINT])
+            face.dtype = [('vertex_indices', 'i4', (3,))]
+            el1 = PlyElement.describe(vertex, 'vertex')
+            el2 = PlyElement.describe(face.flatten(), 'face', val_types={'vertex_indices': 'i4'}, len_types={'vertex_indices': 'u4'})
+            PlyData([el1, el2], text=True).write(export_file_name)
 
-        face = self.simplices.copy()
-        face.dtype = [('vertex_indices', 'i4', (3,))]
-        el1 = PlyElement.describe(vertex, 'vertex')
-        el2 = PlyElement.describe(face.flatten(), 'face', val_types={'vertex_indices': 'i4'}, len_types={'vertex_indices': 'u4'})
-        PlyData([el1, el2], text=True).write(export_file_name)
 
     def createPlanarTriangulation(self, t_crs_str, break_meredian_b=True):
         trs_to_del = []

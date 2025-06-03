@@ -2,6 +2,7 @@ import stripy as stp
 import numpy as np
 from pyproj import Transformer
 from shapely import MultiPolygon, Polygon
+from typing import Union
 from util.util import dif_mx_and_vec_per_col, lengs_xyz, calc_cord_norms, line_grads_calc_mx, indexNB, getdifxy, get_nbr_val, multi_mx_on_vec_per_row, gen_params, calc_sum_mx, calc_sum_mx0, next_neighbor_smoother_mx
 from numba import vectorize, float64, njit, guvectorize, objmode
 NANINT = 2147483646
@@ -118,25 +119,27 @@ def containsXY_NB_array(ps, x, bound, ext=False):
     
     return res
 
-def containsXY_mp_array(ps, mp: MultiPolygon, transformer: Transformer):
+def containsXY_mp_array(ps, mp: MultiPolygon, transformer: Union[Transformer, None]):
     res_in = np.zeros(ps.shape[0], dtype=np.int32)
     for g in mp.geoms:
-        print('start')
         ext = g.exterior
         extx, exty = ext.xy
-        extll = list(transformer.itransform(list(zip(extx, exty)), radians=True))
-        extll = np.array(list(map(lambda x: (x[1], x[0]), extll)))
-        print('startX')
+        if type(transformer) != type(None):
+            extll = list(transformer.itransform(list(zip(extx, exty)), radians=True))
+            extll = np.array(list(map(lambda x: (x[1], x[0]), extll)))
+        else: 
+            extll = np.array(list(zip(np.array(extx) / 180 * 3.14159, np.array(exty) / 180 * 3.14159)))
         ext_x = getX(extll)
-        print('start2')
         ext_in = containsXY_NB_array(ps, ext_x, extll, ext=True)
         inters_in = np.zeros(ps.shape[0], dtype=np.int32)
-        print('stop')
 
         for inter in g.interiors:          
             interx, intery = inter.xy
-            interll = list(transformer.itransform(list(zip(interx, intery)), radians=True))
-            interll = np.array(list(map(lambda x: (x[1], x[0]), interll)))     
+            if type(transformer) != type(None):
+                interll = list(transformer.itransform(list(zip(interx, intery)), radians=True))
+                interll = np.array(list(map(lambda x: (x[1], x[0]), interll)))     
+            else: 
+                interll = np.array(list(zip(np.array(interx) / 180 * 3.14159, np.array(intery) / 180 * 3.14159)))
             curr_x = getX(interll) 
             curr_inter_in = containsXY_NB_array(ps, curr_x, interll, ext=False)
 
@@ -211,7 +214,7 @@ def calculate_gradients_NB(st_p, g_p:gen_params, values, areas, dists_in_t):
     return pnt_grads, line_grads
 
 @njit
-def smart_smoother_NB(st_p, depth: int, nbr_mx):
+def idw_smoother_NB(st_p, depth: int, strength, nbr_mx):
     #lengths = sorted([e.lin.length for e in self.edges])
     #maxl = max(lengths)
     #minl = lengths[int(len(lengths)/1000)]
@@ -225,17 +228,42 @@ def smart_smoother_NB(st_p, depth: int, nbr_mx):
             nbrs = np.array(list(nbrs_set))
             # print(nbrs)
             lons1 = st_p.lons[nbrs]
-            lons2 = np.tile(st_p.lons[i], nbrs.shape[0])
+            lons2 = np.array([st_p.lons[i]]*lons1.shape[0])
             lats1 = st_p.lats[nbrs]
-            lats2 = np.tile(st_p.lats[i], nbrs.shape[0])
+            lats2 = np.array([st_p.lats[i]]*lons1.shape[0])
 
             nbrs_d = np.arccos(np.sin(lats1) * np.sin(lats2) + np.cos(lats1) * np.cos(lats2) * np.cos(lons1 - lons2))
             nbrs_v = st_p.values[nbrs]
-            ws = np.ones(nbrs_d.shape[0])
+            ws = np.ones(nbrs_d.shape[0]) / nbrs_d
             w_nbrs_v = nbrs_v * ws
-            new_v[i] = np.sum(w_nbrs_v) / sum(ws)
+            new_v[i] = st_p.values[i] * (1 - strength) + np.sum(w_nbrs_v) / sum(ws) * strength
     return new_v
 
+@njit
+def nbr_smoother_NB(st_p, depth: int, strength, nbr_mx):
+    #lengths = sorted([e.lin.length for e in self.edges])
+    #maxl = max(lengths)
+    #minl = lengths[int(len(lengths)/1000)]
+    #norml = maxl - minl
+    new_v = np.zeros(st_p.lons.shape[0])           
+    for i in range(st_p.lons.shape[0]):
+        if np.isnan(st_p.lons[i]):
+            new_v[i] = np.nan
+        else:
+            nbrs_set=next_neighbor_smoother_mx(i, np.array([i]), 0, depth, nbr_mx)
+            nbrs = np.array(list(nbrs_set))
+            # print(nbrs)
+            # lons1 = st_p.lons[nbrs]
+            # lons2 = np.tile(st_p.lons[i], nbrs.shape[0])
+            # lats1 = st_p.lats[nbrs]
+            # lats2 = np.tile(st_p.lats[i], nbrs.shape[0])
+
+            # nbrs_d = np.arccos(np.sin(lats1) * np.sin(lats2) + np.cos(lats1) * np.cos(lats2) * np.cos(lons1 - lons2))
+            nbrs_v = st_p.values[nbrs]
+            ws = np.ones(nbrs_v.shape[0])
+            w_nbrs_v = nbrs_v * ws
+            new_v[i] = st_p.values[i] * (1 - strength) + np.sum(w_nbrs_v) / sum(ws) * strength
+    return new_v
 
 def calculate_non_simb_ws_NB(st_p, g_p:gen_params, nbrs, vor_centers, vor_centers_nbrs):
     vor_edgeslen_nbrs_mx = np.zeros(g_p.nbr_mx.shape)
@@ -245,8 +273,12 @@ def calculate_non_simb_ws_NB(st_p, g_p:gen_params, nbrs, vor_centers, vor_center
             ind2 = indexNB(g_p.nbr_mx[p], tr[j-1])
             if vor_edgeslen_nbrs_mx[p][ind1] == 0:
                 if nbrs[i][j-1] != -1:
-                    edge_len = np.arccos(np.sin(vor_centers[i][1]) * np.sin(vor_centers_nbrs[i][j-1][1]) + np.cos(vor_centers[i][1]) * np.cos(
-                        vor_centers_nbrs[i][j-1][1]) * np.cos(vor_centers[i][0] - vor_centers_nbrs[i][j-1][0]))
+                    arg = np.sin(vor_centers[i][1]) * np.sin(vor_centers_nbrs[i][j-1][1]) + np.cos(vor_centers[i][1]) * np.cos(
+                        vor_centers_nbrs[i][j-1][1]) * np.cos(vor_centers[i][0] - vor_centers_nbrs[i][j-1][0])
+                    if -1<=arg<=1:
+                        edge_len = np.arccos(arg)
+                    else:
+                        edge_len = 0
                 else:
                     dist_to_c = stp.sTriangulation.angular_separation(stp.sTriangulation, vor_centers[i][0], vor_centers[i][1], st_p.lons[p], st_p.lons[p]).item()
                     dist_to_nbr = stp.sTriangulation.angular_separation(stp.sTriangulation, st_p.lons[tr[j-2]], st_p.lats[tr[j-2]], st_p.lons[p], st_p.lons[p]).item()
@@ -254,12 +286,17 @@ def calculate_non_simb_ws_NB(st_p, g_p:gen_params, nbrs, vor_centers, vor_center
                 vor_edgeslen_nbrs_mx[p][ind1] = edge_len 
             if vor_edgeslen_nbrs_mx[p][ind2] == 0:
                 if nbrs[i][j-2] != -1:
-                    edge_len = stp.sTriangulation.angular_separation(stp.sTriangulation, vor_centers[i][0], vor_centers[i][1], vor_centers_nbrs[i][j-2][0], vor_centers_nbrs[i][j-2][1]).item()
+                    arg = np.sin(vor_centers[i][1]) * np.sin(vor_centers_nbrs[i][j-2][1]) + np.cos(vor_centers[i][1]) * np.cos(
+                        vor_centers_nbrs[i][j-2][1]) * np.cos(vor_centers[i][0] - vor_centers_nbrs[i][j-2][0])
+                    if -1<=arg<=1:
+                        edge_len = np.arccos(arg)
+                    else:
+                        edge_len = 0
                 else:
                     dist_to_c = stp.sTriangulation.angular_separation(stp.sTriangulation, vor_centers[i][0], vor_centers[i][1], st_p.lons[p], st_p.lons[p]).item()
                     dist_to_nbr = stp.sTriangulation.angular_separation(stp.sTriangulation, st_p.lons[tr[j-1]], st_p.lats[tr[j-1]], st_p.lons[p], st_p.lons[p]).item()
                     edge_len = np.sqrt(dist_to_c**2 - (dist_to_nbr/2)**2)
-                vor_edgeslen_nbrs_mx[p][ind1] = edge_len 
+                vor_edgeslen_nbrs_mx[p][ind2] = edge_len 
 
     
     non_simb_ws = vor_edgeslen_nbrs_mx * 6371000 / g_p.nbr_dists

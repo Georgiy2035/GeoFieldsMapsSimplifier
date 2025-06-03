@@ -10,7 +10,7 @@ from plyfile import PlyData, PlyElement
 from copy import deepcopy
 
 from util.util import deleteTriangleNB_arr, getMultiPolygonFromFile, calcNbrMatrixNB, indexNB, gen_params, calculate_distances_NB_mx, dif_mx_and_vec_per_col, push_grad_min_NB, push_grad_NB, non_simbson_smooth_NB
-from planar.util_t import calculate_gradients_NB, smart_smoother_NB, lengs_xy, calculate_non_simb_ws_NB
+from planar.util_t import calculate_gradients_NB, idw_smoother_NB, nbr_smoother_NB, lengs_xy, calculate_non_simb_ws_NB, calc_graphic_hardness_NB
 
 NANINT = 2147483646
 
@@ -168,10 +168,19 @@ class t_gen(stp.Triangulation):
             self.g_p.grads2y, self.g_p.lin_grads2y = calculate_gradients_NB(self.t_p, self.g_p, self.g_p.grads1[:, 1], areas, dists_in_t) 
 
 
-    def smart_smoother(self, depth=1):       
+    def idw_smooth(self, depth=1, strength=1):       
         if self.gen_params == False:
             self.calc_gen_params()
-        new_v = smart_smoother_NB(self.t_p, depth, self.g_p.nbr_mx)
+        new_v = idw_smoother_NB(self.t_p, depth, strength, self.g_p)
+        new_t = t_gen(t_p=self.t_p, data_crs=self.data_crs, g_p=self.g_p)
+        new_t.t_p.values = new_v
+        new_t.upd_st()
+        return new_t
+    
+    def nbr_smooth(self, depth=1, strength=1):       
+        if self.gen_params == False:
+            self.calc_gen_params()
+        new_v = nbr_smoother_NB(self.t_p, depth, strength, self.g_p)
         new_t = t_gen(t_p=self.t_p, data_crs=self.data_crs, g_p=self.g_p)
         new_t.t_p.values = new_v
         new_t.upd_st()
@@ -216,72 +225,9 @@ class t_gen(stp.Triangulation):
         new_t.upd_st()
         return new_t
         
-    def calc_graphic_hardness(self, iso_list, scale=1/1000000, width=0.001):
-        @njit
-        def calc_graphic_hardness_NB(t_p: t_params, areas, iso_list, scale, width):
-            gh = np.zeros(t_p.trs.shape[0])
-            res_iso_vecs = np.array([[0., 0.]])
-            for i, tr in enumerate(t_p.trs):
-                iso_side_points_all = np.array([[0., 0.]])
-                iso_side_all = np.array([0.])
-                iso_side_num = np.array([0, 0, 0])
-                
-                for j, p in enumerate(tr):
-                    if t_p.values[p] > t_p.values[tr[j-1]]:
-                        iso_side_bool = np.logical_and((iso_list < t_p.values[p]), (iso_list > t_p.values[tr[j-1]]))
-                        iso_side = iso_list[iso_side_bool]
-                        p0 = np.array([t_p.x[tr[j-1]], t_p.y[tr[j-1]], t_p.values[tr[j-1]]])
-                        p1 = np.array([t_p.x[p], t_p.y[p], t_p.values[p]])    
-                    elif t_p.values[p] < t_p.values[tr[j-1]]:
-                        iso_side_bool = np.logical_and(iso_list > t_p.values[p], iso_list < t_p.values[tr[j-1]])
-                        iso_side = iso_list[iso_side_bool]
-                        p1 = np.array([t_p.x[tr[j-1]], t_p.y[tr[j-1]], t_p.values[tr[j-1]]])
-                        p0 = np.array([t_p.x[p], t_p.y[p], t_p.values[p]])
-                    else:
-                        continue
-                    vec = p1 - p0
-                    iso_side_num[j] = iso_side.shape[0]
-                    if iso_side_num[j] == 0:
-                        continue
-                    iso_start_ps = np.array(list(zip((iso_side - p0[2]) * vec[0] / vec[2] + p0[0],
-                                                        (iso_side - p0[2]) * vec[1] / vec[2] + p0[1])))
-                    iso_side_points_all = np.concatenate((iso_side_points_all, iso_start_ps))
-                    iso_side_all = np.concatenate((iso_side_all, iso_side))
-                    
-
-                if iso_side_num[0] == 0 and iso_side_num[1] == 0:
-                    gh[i] = 0
-                    continue
-                
-                iso_side_all = iso_side_all[1:]
-                iso_side0 = iso_side_all[0:iso_side_num[0]]
-                iso_side1 = iso_side_all[iso_side_num[0]:iso_side_num[1]]
-                iso_side2 = iso_side_all[iso_side_num[1]:]
-
-                iso_side_points_all = iso_side_points_all[1:]
-                iso_side_points0 = iso_side_points_all[0:iso_side_num[0]]
-                iso_side_points1 = iso_side_points_all[iso_side_num[0]:iso_side_num[1]]
-                iso_side_points2 = iso_side_points_all[iso_side_num[1]:]
-                for j, iso in enumerate(iso_side0):
-                    if iso in iso_side1:
-                        ind_iso = indexNB(iso_side1, iso)
-                        res_iso_vecs = np.concatenate((res_iso_vecs, (iso_side_points0[j] - iso_side_points1[ind_iso]).reshape(1, 2)))
-                    elif iso in iso_side2:
-                        ind_iso = indexNB(iso_side2, iso)
-                        res_iso_vecs = np.concatenate((res_iso_vecs, (iso_side_points0[j] - iso_side_points2[ind_iso]).reshape(1, 2)))
-                for j, iso in enumerate(iso_side1):
-                    if iso in iso_side2:
-                        ind_iso = indexNB(iso_side2, iso)
-                        res_iso_vecs = np.concatenate((res_iso_vecs, (iso_side_points1[j] - iso_side_points2[ind_iso]).reshape(1, 2))) 
-
-                iso_lengs = lengs_xy(res_iso_vecs[:, 0], res_iso_vecs[:, 1])
-                lengs_sum = np.sum(iso_lengs)
-                square = lengs_sum * width / scale
-                gh[i] = square / areas[i]
-            return gh
-
+    def calc_graphic_hardness(self, iso_list, scale=1/1000000, width=1):
         areas = self.areas()
-        self.gh = calc_graphic_hardness_NB(self.t_p, areas, iso_list, scale=scale, width=width)
+        self.gh = calc_graphic_hardness_NB(self.t_p, areas, iso_list, scale=scale, width=width / 1000)
 
 
     def export_to_ply(self, export_file_name: str, export_crs_str: Union[str, None] = None):

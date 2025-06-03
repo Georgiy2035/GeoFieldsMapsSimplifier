@@ -5,14 +5,80 @@ from util.util import getNeighboursNB_arr, indexNB, getdifxy, lengs_xyz, calc_co
 NANINT = 2147483646
 
 
-@njit
-def getxy(c, lst, lptr, n):
-    if n == 0:
-        return np.array([c[ptr] if ptr != NANINT else np.nan for ptr in lst])
-    else:
-        return np.array([c[lst[ptr]] if ptr != NANINT else np.nan for ptr in lptr])
+# @njit
+# def getxy(c, lst, lptr, n):
+#     if n == 0:
+#         return np.array([c[ptr] if ptr != NANINT else np.nan for ptr in lst])
+#     else:
+#         return np.array([c[lst[ptr]] if ptr != NANINT else np.nan for ptr in lptr])
     
 
+def calc_graphic_hardness_NB(t_p, areas, iso_list, scale, width):
+    gh = np.zeros(t_p.trs.shape[0])
+    res_iso_vecs = np.array([[0., 0.]])
+    for i, tr in enumerate(t_p.trs):
+        iso_side_points_all = np.array([[0., 0.]])
+        iso_side_all = np.array([0.])
+        iso_side_num = np.array([0, 0, 0])
+        
+        for j, p in enumerate(tr):
+            if t_p.values[p] > t_p.values[tr[j-1]]:
+                iso_side_bool = np.logical_and((iso_list < t_p.values[p]), (iso_list > t_p.values[tr[j-1]]))
+                iso_side = iso_list[iso_side_bool]
+                p0 = np.array([t_p.x[tr[j-1]], t_p.y[tr[j-1]], t_p.values[tr[j-1]]])
+                p1 = np.array([t_p.x[p], t_p.y[p], t_p.values[p]])    
+            elif t_p.values[p] < t_p.values[tr[j-1]]:
+                iso_side_bool = np.logical_and(iso_list > t_p.values[p], iso_list < t_p.values[tr[j-1]])
+                iso_side = iso_list[iso_side_bool]
+                p1 = np.array([t_p.x[tr[j-1]], t_p.y[tr[j-1]], t_p.values[tr[j-1]]])
+                p0 = np.array([t_p.x[p], t_p.y[p], t_p.values[p]])
+            else:
+                continue
+            # if True in iso_side_bool:
+            #     print(iso_side)
+            # print(tr)
+            vec = p1 - p0
+            #print(iso_side_all)
+            iso_side_num[j] = iso_side.shape[0]
+            if iso_side_num[j] == 0:
+                continue
+            iso_start_ps = np.array(list(zip((iso_side - p0[2]) * vec[0] / vec[2] + p0[0],
+                                            (iso_side - p0[2]) * vec[1] / vec[2] + p0[1])))
+            iso_side_points_all = np.concatenate((iso_side_points_all, iso_start_ps))
+            iso_side_all = np.concatenate((iso_side_all, iso_side))
+            
+            
+
+        if iso_side_num[0] == 0 and iso_side_num[1] == 0:
+            gh[i] = 0
+            continue
+        
+        iso_side_all = iso_side_all[1:]
+        iso_side0 = iso_side_all[0:iso_side_num[0]]
+        iso_side1 = iso_side_all[iso_side_num[0]:iso_side_num[1]]
+        iso_side2 = iso_side_all[iso_side_num[1]:]
+
+        iso_side_points_all = iso_side_points_all[1:]
+        iso_side_points0 = iso_side_points_all[0:iso_side_num[0]]
+        iso_side_points1 = iso_side_points_all[iso_side_num[0]:iso_side_num[1]]
+        iso_side_points2 = iso_side_points_all[iso_side_num[1]:]
+        for j, iso in enumerate(iso_side0):
+            if iso in iso_side1:
+                ind_iso = indexNB(iso_side1, iso)
+                res_iso_vecs = np.concatenate((res_iso_vecs, (iso_side_points0[j] - iso_side_points1[ind_iso]).reshape(1, 2)))
+            elif iso in iso_side2:
+                ind_iso = indexNB(iso_side2, iso)
+                res_iso_vecs = np.concatenate((res_iso_vecs, (iso_side_points0[j] - iso_side_points2[ind_iso]).reshape(1, 2)))
+        for j, iso in enumerate(iso_side1):
+            if iso in iso_side2:
+                ind_iso = indexNB(iso_side2, iso)
+                res_iso_vecs = np.concatenate((res_iso_vecs, (iso_side_points1[j] - iso_side_points2[ind_iso]).reshape(1, 2))) 
+
+        iso_lengs = lengs_xy(res_iso_vecs[:, 0], res_iso_vecs[:, 1])
+        lengs_sum = np.sum(iso_lengs)
+        square = lengs_sum * width / 1000 / scale
+        gh[i] = square / areas[i]
+    return gh
 
 
 
@@ -78,7 +144,7 @@ def lengs_xy(x, y):
 
 
 @njit
-def smart_smoother_NB(t_p, depth: int, nbr_mx):
+def idw_smoother_NB(t_p, depth: int, strength, g_p):
     #lengths = sorted([e.lin.length for e in self.edges])
     #maxl = max(lengths)
     #minl = lengths[int(len(lengths)/1000)]
@@ -89,7 +155,30 @@ def smart_smoother_NB(t_p, depth: int, nbr_mx):
             new_v[i] = np.nan
         else:
             #nbrs_set=next_neighbor_smoother(i, np.array([i]), 0, depth, t_p)
-            nbrs_set=next_neighbor_smoother_mx(i, np.array([i]), 0, depth, nbr_mx)
+            nbrs_set=next_neighbor_smoother_mx(i, np.array([i]), 0, depth, g_p.nbr_mx)
+            nbrs = np.array(list(nbrs_set))
+            nbrs_x = g_p.nbr_x[nbrs]
+            nbrs_y = g_p.nbr_y[nbrs]
+            nbrs_v = t_p.values[nbrs]
+            dists = lengs_xy(nbrs_x, nbrs_y)
+            ws = np.ones(nbrs_x.shape[0]) / dists
+            w_nbrs_v = nbrs_v * ws
+            new_v[i] = t_p.values[i] * (1-strength) + np.sum(w_nbrs_v) / sum(ws) * strength
+    return new_v
+
+@njit
+def nbr_smoother_NB(t_p, depth: int, strength, g_p):
+    #lengths = sorted([e.lin.length for e in self.edges])
+    #maxl = max(lengths)
+    #minl = lengths[int(len(lengths)/1000)]
+    #norml = maxl - minl
+    new_v = np.zeros(t_p.x.shape[0])           
+    for i in range(t_p.x.shape[0]):
+        if np.isnan(t_p.x[i]):
+            new_v[i] = np.nan
+        else:
+            #nbrs_set=next_neighbor_smoother(i, np.array([i]), 0, depth, t_p)
+            nbrs_set=next_neighbor_smoother_mx(i, np.array([i]), 0, depth, g_p.nbr_mx)
             nbrs = np.array(list(nbrs_set))
             nbrs_x = t_p.x[nbrs] - t_p.x[i]
             nbrs_y = t_p.y[nbrs] - t_p.y[i]
@@ -97,7 +186,7 @@ def smart_smoother_NB(t_p, depth: int, nbr_mx):
             #dists = lengs_xy(nbrs_x, nbrs_y)
             ws = np.ones(nbrs_x.shape[0])
             w_nbrs_v = nbrs_v * ws
-            new_v[i] = np.sum(w_nbrs_v) / sum(ws)
+            new_v[i] = t_p.values[i] * (1-strength) + np.sum(w_nbrs_v) / sum(ws) * strength
     return new_v
 
 
